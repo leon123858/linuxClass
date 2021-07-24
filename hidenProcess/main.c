@@ -1,14 +1,18 @@
 #include <linux/cdev.h>
 #include <linux/ftrace.h>
 #include <linux/kallsyms.h>
+#include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
+#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 
 enum RETURN_CODE { SUCCESS };
+
+unsigned long vfunc = 0xffffffffb68bfcb0;
 
 struct ftrace_hook {
   const char *name;
@@ -18,7 +22,7 @@ struct ftrace_hook {
 };
 
 static int hook_resolve_addr(struct ftrace_hook *hook) {
-  hook->address = kallsyms_lookup_name(hook->name);
+  hook->address = vfunc;
   if (!hook->address) {
     printk("unresolved symbol: %s\n", hook->name);
     return -ENOENT;
@@ -100,7 +104,8 @@ static struct pid *hook_find_ge_pid(int nr, struct pid_namespace *ns) {
 }
 
 static void init_hook(void) {
-  real_find_ge_pid = (find_ge_pid_func)kallsyms_lookup_name("find_ge_pid");
+  // real_find_ge_pid = (find_ge_pid_func)kallsyms_lookup_name("find_ge_pid");
+  real_find_ge_pid = (find_ge_pid_func)vfunc;
   hook.name = "find_ge_pid";
   hook.func = hook_find_ge_pid;
   hook.orig = &real_find_ge_pid;
@@ -150,6 +155,16 @@ static ssize_t device_read(struct file *filep, char *buffer, size_t len,
   return *offset;
 }
 
+static int char_place(char *str, char c) {
+  int len = strlen(str);
+  int i;
+  for (i = 0; i < len; i++) {
+    if (str[i] == c)
+      return i;
+  }
+  return -1;
+}
+
 static ssize_t device_write(struct file *filep, const char *buffer, size_t len,
                             loff_t *offset) {
   long pid;
@@ -162,9 +177,27 @@ static ssize_t device_write(struct file *filep, const char *buffer, size_t len,
   message = kmalloc(len + 1, GFP_KERNEL);
   memset(message, 0, len + 1);
   copy_from_user(message, buffer, len);
+  printk(KERN_INFO "@ %s\n", message);
   if (!memcmp(message, add_message, sizeof(add_message) - 1)) {
-    kstrtol(message + sizeof(add_message), 10, &pid);
-    hide_process(pid);
+    char *goal;
+    char *tmpCharPtr;
+    goal = message + sizeof(add_message);
+    while (1) {
+      int dotPlace = char_place(goal, ',');
+      if (dotPlace < 0) {
+        kstrtol(goal, 10, &pid);
+        hide_process(pid);
+        printk(KERN_INFO "@ %lu\n", pid);
+        break;
+      }
+      tmpCharPtr = kmalloc(dotPlace + 1, GFP_KERNEL);
+      strncpy(tmpCharPtr, goal, dotPlace);
+      kstrtol(tmpCharPtr, 10, &pid);
+      hide_process(pid);
+      printk(KERN_INFO "@ %lu\n", pid);
+      kfree(tmpCharPtr);
+      goal += (dotPlace + 1) * sizeof(char);
+    }
   } else if (!memcmp(message, del_message, sizeof(del_message) - 1)) {
     kstrtol(message + sizeof(del_message), 10, &pid);
     unhide_process(pid);
