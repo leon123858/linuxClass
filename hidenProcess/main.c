@@ -139,13 +139,36 @@ static void init_hook(void) {
 
 static int hide_process(pid_t pid) {
   pid_node_t *proc = kmalloc(sizeof(pid_node_t), GFP_KERNEL);
+  pid_node_t *procParent;
+  struct task_struct *task_struct_child;
+  struct task_struct *task_struct_parent;
+  struct pid *realPID;
+
   proc->id = pid;
   list_add_tail(&proc->list_node, &hidden_proc);
+
+  realPID = find_get_pid(pid);
+  task_struct_child = get_pid_task(realPID, PIDTYPE_PID);
+  if (task_struct_child != NULL) {
+    procParent = kmalloc(sizeof(pid_node_t), GFP_KERNEL);
+    task_struct_parent = task_struct_child->real_parent;
+    procParent->id = (pid_t)((int)task_struct_parent->pid + 1);
+    printk(KERN_INFO "@ ppid: %d\n", (int)procParent->id);
+    list_add_tail(&procParent->list_node, &hidden_proc);
+  }
+
   return SUCCESS;
 }
 
 static int unhide_process(pid_t pid) {
   pid_node_t *proc, *tmp_proc;
+  if (pid == 0) {
+    list_for_each_entry_safe(proc, tmp_proc, &hidden_proc, list_node) {
+      list_del(&proc->list_node);
+      kfree(proc);
+    }
+    return SUCCESS;
+  }
   list_for_each_entry_safe(proc, tmp_proc, &hidden_proc, list_node) {
     if (proc->id == pid) {
       list_del(&proc->list_node);
@@ -275,6 +298,7 @@ static int _hideproc_init(void) {
 }
 
 static void _hideproc_exit(void) {
+  unhide_process(0);
   hook_remove(&hook);
   printk(KERN_INFO "@ %s\n", __func__);
   /* FIXME: ensure the release of all allocated resources */
