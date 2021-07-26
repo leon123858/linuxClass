@@ -1,4 +1,5 @@
 #include <linux/cdev.h>
+#include <linux/device.h>
 #include <linux/ftrace.h>
 #include <linux/kallsyms.h>
 #include <linux/list.h>
@@ -262,6 +263,8 @@ static ssize_t device_write(struct file *filep, const char *buffer, size_t len,
 
 static struct cdev cdev;
 static struct class *hideproc_class = NULL;
+static dev_t *devPtr = NULL;
+static int dev_major;
 
 static const struct file_operations fops = {
     .owner = THIS_MODULE,
@@ -275,16 +278,20 @@ static const struct file_operations fops = {
 #define DEVICE_NAME "hideproc"
 
 static int _hideproc_init(void) {
-  int err, dev_major, r;
+  int err, r;
   dev_t dev;
   printk(KERN_INFO "@ %s\n", __func__);
+  // 配置裝置所需空間
   err = alloc_chrdev_region(&dev, 0, MINOR_VERSION, DEVICE_NAME);
+  devPtr = &dev;
+  // 生成裝置編號
   dev_major = MAJOR(dev);
-
+  // 創建編號類別
   hideproc_class = class_create(THIS_MODULE, DEVICE_NAME);
-
+  // 將字元裝置的裝置編號註冊進核心系統
   cdev_init(&cdev, &fops);
   cdev_add(&cdev, MKDEV(dev_major, MINOR_VERSION), 1);
+  // 創建裝置所需文件
   device_create(hideproc_class, NULL, MKDEV(dev_major, MINOR_VERSION), NULL,
                 DEVICE_NAME);
 
@@ -298,8 +305,21 @@ static int _hideproc_init(void) {
 }
 
 static void _hideproc_exit(void) {
+  // 清空 hideProcess List, 已設定好設為0就是全清
   unhide_process(0);
+  // 註銷 ftrace 的 hook ,包含設定回調函數以及設定綁定 address
   hook_remove(&hook);
+
+  /* 釋放字元裝置*/
+  // 刪除裝置文件
+  device_destroy(hideproc_class, MKDEV(dev_major, MINOR_VERSION));
+  // 註銷裝置號
+  cdev_del(&cdev);
+  // 刪除該裝置類別
+  class_destroy(hideproc_class);
+  // 釋放裝置空間
+  unregister_chrdev_region(*devPtr, MINOR_VERSION);
+
   printk(KERN_INFO "@ %s\n", __func__);
   /* FIXME: ensure the release of all allocated resources */
 }
