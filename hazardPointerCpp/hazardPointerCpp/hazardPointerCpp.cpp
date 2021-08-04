@@ -1,7 +1,7 @@
 ﻿#include <iostream>
 #include <atomic>
 #include <thread>
-
+#include <mutex>
 #define THREAD_N 100
 #define ELEMENT_N 100
 
@@ -11,6 +11,7 @@ static atomic_int deletes = 0;
 static thread_local  int local_tid = -1;
 static atomic_uintptr_t global_tid = 0;
 static atomic_int retireNow = 0;
+mutex gMutex;
 
 static inline int tid() {
 	if (local_tid < 0) {
@@ -105,19 +106,19 @@ public:
 	int tid;
 	int status = 0;
 	threadViewNode* next;
-	int threadViewNow[3];
+	atomic_int threadViewNow[3];
 	threadViewNode(int tid) {
 		this->tid = tid;
 		next = nullptr;
 		for (int i = 0; i < 3; i++) {
-			threadViewNow[i] = -1;
+			threadViewNow[i].store(-1);
 		}
 	}
 
 	void pushNode(node* nodeT) {
 		if (nodeT == nullptr) return;
 		//cout << "tmp:" << nodeT->value;
-		threadViewNow[status] = nodeT->value;
+		threadViewNow[status].store(nodeT->value);
 		if (++status > 2)
 			status = 0;
 	}
@@ -125,7 +126,7 @@ public:
 	void clearNode() {
 		status = 0;
 		for (int i = 0; i < 3; i++) {
-			threadViewNow[i] = -1;
+			threadViewNow[i].store(-1);
 		}
 	}
 };
@@ -201,6 +202,11 @@ public:
 		{
 			for (node* ptr = head.load(); ptr; ptr = ptr->next)
 			{
+				if (ptr == (node*)(0xDDDDDDDD)) break;
+				//if (ptr == nullptr) {
+				//	tmpViewTable.releaseNode(tid());
+				//	return;
+				//}
 				tmpViewTable.addThreadTmpView(tid(), *ptr);
 				if (ptr->value == value) {
 					this->retireList.pushNode(*ptr);
@@ -231,19 +237,23 @@ public:
 			if (isDelete) {
 				node* front = head.load();
 				if (front == ptr->nodePtr) {
-					cout << "delete:" << ptr->nodePtr->value << endl;
+					//cout << "delete:" << ptr->nodePtr->value << endl;
 					ptr =  retireList.deleteNode(ptr);
 					head.store(front->next);
-					delete front;
+					//delete front;
+					front = nullptr;
 					deletes.fetch_add(1);
 					goto skip_loop_plus;
 				}
 				for (node* innerPtr = front->next; innerPtr; innerPtr = innerPtr->next) {
 					if (innerPtr == ptr->nodePtr) {
-						cout << "delete:" << ptr->nodePtr->value << endl;
+						//cout << "delete:" << ptr->nodePtr->value << endl;
 						ptr = retireList.deleteNode(ptr);
+						gMutex.lock();
 						front->next = innerPtr->next;
-						delete innerPtr;
+						gMutex.unlock();
+						//delete innerPtr;
+						innerPtr = nullptr;
 						deletes.fetch_add(1);
 						goto skip_loop_plus;
 					}
