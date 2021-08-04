@@ -2,14 +2,16 @@
 #include <atomic>
 #include <thread>
 
-#define THREAD_N 2
-#define ELEMENT_N 2
+#define THREAD_N 100
+#define ELEMENT_N 100
 
 using namespace std;
 static atomic_int inserts = 0;
 static atomic_int deletes = 0;
 static thread_local  int local_tid = -1;
 static atomic_uintptr_t global_tid = 0;
+static atomic_int retireNow = 0;
+
 static inline int tid() {
 	if (local_tid < 0) {
 		local_tid = global_tid.fetch_add(1);
@@ -21,6 +23,7 @@ class node {
 public:
 	node* next;
 	int  value;
+
 	node(int value) {
 		this->value = value;
 		next = nullptr;
@@ -66,6 +69,26 @@ public:
 			tail = head = head.load();
 	}
 
+	ptrNode* deleteNode(ptrNode* ptr) {
+		ptrNode* front = head.load();
+		if (front == ptr) {
+			head.store(front->next);
+			ptr = ptr->next;
+			delete front;
+			return ptr;
+		}
+		for (ptrNode* innerPtr = front->next; innerPtr; innerPtr = innerPtr->next) {
+			if (innerPtr == ptr) {
+				front->next = innerPtr->next;
+				ptr = ptr->next;
+				delete innerPtr;
+				break;
+			}
+			front = front->next;
+		}
+		return ptr;
+	}
+
 	void clearNodes() {
 		ptrNode* delPtr;
 		for (ptrNode* ptr = (ptrNode*)head; ptr;)
@@ -93,6 +116,7 @@ public:
 
 	void pushNode(node* nodeT) {
 		if (nodeT == nullptr) return;
+		//cout << "tmp:" << nodeT->value;
 		threadViewNow[status] = nodeT->value;
 		if (++status > 2)
 			status = 0;
@@ -126,7 +150,6 @@ public:
 		while (!head.compare_exchange_weak(n->next, n));
 		if (head == nullptr || tail == nullptr)
 			tail = head = head.load();
-		//addThreadTmpView(tid, node);
 	}
 
 	void addThreadTmpView(int tid, node& node) {
@@ -141,9 +164,7 @@ public:
 	void releaseNode(int tid) {
 		for (threadViewNode* ptr = head.load(); ptr; ptr = ptr->next) {
 			if (ptr->tid == tid) {
-				for (int i = 0; i < 3; i++) {
-					ptr->threadViewNow[i] = 0;
-				}
+				ptr->clearNode();
 				return;
 			}
 		}
@@ -164,28 +185,26 @@ public:
 	}
 
 	void pushNode(int value) {
-		//tmpViewTable.addThreadTmpView(tid(), *head.load());
+		tmpViewTable.addThreadTmpView(tid(), *head.load());
 		node* n = new node(value);
 		n->next = head.load();
-		//tmpViewTable.addThreadTmpView(tid(), *head.load());
+		tmpViewTable.addThreadTmpView(tid(), *head.load());
 		while (!head.compare_exchange_weak(n->next, n));
-		//tmpViewTable.releaseNode(tid());
+		tmpViewTable.releaseNode(tid());
 		if (head == NULL || tail == NULL)
 			tail = head = head.load();
-		//retireNode();
 	}
 
 	void deleteNode(int value) {
+		retireNode();
 		while (true)
 		{
 			for (node* ptr = head.load(); ptr; ptr = ptr->next)
 			{
-				if (ptr == (node*)(0xdddddddd) ) return;
-				//tmpViewTable.addThreadTmpView(tid(), *ptr);
+				tmpViewTable.addThreadTmpView(tid(), *ptr);
 				if (ptr->value == value) {
-					//cout << "delete-> " << value << endl;
 					this->retireList.pushNode(*ptr);
-					//tmpViewTable.releaseNode(tid());
+					tmpViewTable.releaseNode(tid());
 					return;
 				}
 				if (ptr == tail.load()) break;
@@ -194,41 +213,45 @@ public:
 	}
 
 	void retireNode() {
-		cout << "retire" << endl;
-		for (ptrNode* ptr = retireList.head; ptr != retireList.tail; ptr = ptr->next) {
-			//if (ptr->nodePtr->value == (0xdddddddd) || ptr == nullptr) return;
-			cout  << ptr->nodePtr->value << endl;
+		if (retireNow.fetch_add(1) != 0)
+			return;
+		for (ptrNode* ptr = retireList.head; ptr ; ptr = ptr->next) {
+		skip_loop_plus:
+			if (ptr == nullptr) {
+				retireNow.store(0);
+				return;
+			}
 			bool isDelete = true;
-			for (threadViewNode* threadPtr = tmpViewTable.getHead(); threadPtr != tmpViewTable.tail.load(); threadPtr = threadPtr->next) {
+			for (threadViewNode* threadPtr = tmpViewTable.getHead(); threadPtr; threadPtr = threadPtr->next) {
 				for (int i = 0; i < 3; i++) {
-					cout << "tid:" << threadPtr->tid << endl;
 					if (threadPtr->threadViewNow[i] == ptr->nodePtr->value)
 						isDelete = false;
 				}
 			}
 			if (isDelete) {
 				node* front = head.load();
-				tmpViewTable.addThreadTmpView(tid(), *front);
 				if (front == ptr->nodePtr) {
+					cout << "delete:" << ptr->nodePtr->value << endl;
+					ptr =  retireList.deleteNode(ptr);
 					head.store(front->next);
 					delete front;
-					tmpViewTable.releaseNode(tid());
 					deletes.fetch_add(1);
-					continue;
+					goto skip_loop_plus;
 				}
 				for (node* innerPtr = front->next; innerPtr; innerPtr = innerPtr->next) {
-					tmpViewTable.addThreadTmpView(tid(), *innerPtr);
 					if (innerPtr == ptr->nodePtr) {
+						cout << "delete:" << ptr->nodePtr->value << endl;
+						ptr = retireList.deleteNode(ptr);
 						front->next = innerPtr->next;
 						delete innerPtr;
 						deletes.fetch_add(1);
-						break;
+						goto skip_loop_plus;
 					}
 					front = front->next;
 				}
-				tmpViewTable.releaseNode(tid());
 			}
 		}
+		retireNow.store(0);
 	}
 };
 
