@@ -2,12 +2,14 @@
 #include <atomic>
 #include <thread>
 #define THREAD_N 100
-#define ELEMENT_N 1000
+#define ELEMENT_N 100
 #define INSERT_N THREAD_N*ELEMENT_N
 
 using namespace std;
 static atomic_int inserts = 0;
 static atomic_int deletes = 0;
+
+static atomic_int nodeDeleteCount = 0;
 
 /**
 		*  標記 (marked) 的原理 :
@@ -45,6 +47,11 @@ public:
 		next.store(nullptr);
 		inserts.fetch_add(1);
 	}
+
+	~node()
+	{
+		nodeDeleteCount.fetch_add(1);
+	}
 };
 
 
@@ -55,6 +62,10 @@ public:
 	ptrNode(node* n) {
 		nodePtr = n;
 		next = nullptr;
+	}
+	~ptrNode()
+	{
+		delete nodePtr;
 	}
 };
 
@@ -77,13 +88,15 @@ public:
 
 	void deleteNodes() {
 		ptrNode* delPtr;
+		int total = 0;
 		for (ptrNode* ptr = getHead(); ptr;)
 		{
+			total++;
 			delPtr = ptr;
 			ptr = ptr->next;
 			delete delPtr;
 		}
-		cout << "clean retireList" << endl;
+		cout << "final node in retireList : " << total << endl;
 	}
 
 	retireList() {
@@ -188,10 +201,10 @@ public:
 				if (right_node->next.compare_exchange_weak(right_node_next, (node*)get_marked_ref(right_node_next)))
 					break; // 當右節點的next沒被標記, 就標記右節點的next
 		} while (true);
+		retireList.pushNode(right_node);
 		// 試著使左結點跳過右節點往下走, 失敗就再跑一次搜尋, 其可以跳過被標記節點。
 		if (!left_node->next.compare_exchange_weak(right_node, right_node_next))
 			getLeftNodeAndRightNode(value);
-		retireList.pushNode(right_node);
 		deletes.fetch_add(1);
 		return;
 	}
@@ -249,6 +262,7 @@ int main()
 	}
 	delete testlinkList;
 
-	cout << "inserts:" << atomic_load(&inserts) << "  count" << count << endl;
-	cout << "delete: " << atomic_load(&deletes) << endl;
+	cout << "inserts : " << atomic_load(&inserts) << "  after opration count : " << count << endl;
+	cout << "logic delete : " << atomic_load(&deletes) << endl;
+	cout << "phycical delete : " << nodeDeleteCount.load() << endl;
 }

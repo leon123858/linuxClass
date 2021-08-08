@@ -1,98 +1,292 @@
 ﻿#include <iostream>
 #include <atomic>
 #include <thread>
-#include <mutex>
+#define TMP_WIDTH_N 3
 #define THREAD_N 100
 #define ELEMENT_N 100
-
+#define INSERT_N THREAD_N*ELEMENT_N
+#define TID_UNKNOWN -1
 using namespace std;
 static atomic_int inserts = 0;
 static atomic_int deletes = 0;
-static thread_local  int local_tid = -1;
-static atomic_uintptr_t global_tid = 0;
-static atomic_int retireNow = 0;
-mutex gMutex;
 
-static inline int tid() {
-	if (local_tid < 0) {
-		local_tid = global_tid.fetch_add(1);
+static atomic_int nodeDeleteCount = 0;
+
+static thread_local int tid_v = TID_UNKNOWN;
+static atomic_int_fast32_t tid_v_base = ATOMIC_VAR_INIT(0);
+
+static atomic_int_fast32_t retireNow = 0;
+
+static atomic_int k = 0;
+
+static inline int tid(void)
+{
+	if (tid_v == TID_UNKNOWN) {
+		tid_v = atomic_fetch_add(&tid_v_base, 1);
 	}
-	return local_tid;
+	return tid_v;
 }
+
+// true : 被marked了
+static inline bool is_marked_ref(void* i)
+{
+	return (bool)((uintptr_t)i & 0x1L);
+}
+
+static inline void* get_unmarked_ref(void* w)
+{
+	return (void*)((uintptr_t)w & ~0x1L);
+}
+
+static inline void* get_marked_ref(void* w)
+{
+	return (void*)((uintptr_t)w | 0x1L);
+}
+
 
 class node {
 public:
-	node* next;
+	atomic <node*> next;
 	int  value;
 
 	node(int value) {
 		this->value = value;
-		next = nullptr;
+		next.store(nullptr);
 		inserts.fetch_add(1);
 	}
-	node(int value, node* n) {
-		// can not use in atomic
-		this->value = value;
-		next = n;
+
+	~node()
+	{
+		nodeDeleteCount.fetch_add(1);
 	}
 };
+
 
 class ptrNode {
 public:
-	node* nodePtr;
-	ptrNode* next;
+	unsigned int nodePtr;
+	atomic <ptrNode*> next;
 	ptrNode(node* n) {
-		nodePtr = n;
-		next = nullptr;
+		nodePtr = (unsigned int)n;
+		next.store(nullptr);
 	}
-	ptrNode(node* n, ptrNode* next) {
-		nodePtr = n;
-		this->next = next;
+	~ptrNode()
+	{
+		delete (node*)nodePtr;
 	}
 };
 
-class retireList {
+
+class retireList
+{
 public:
-	atomic<ptrNode*>  head, tail;
-	retireList() {
-		head = tail = nullptr;
-	}
+	ptrNode* head, * tail;
+	atomic <unsigned int> tmpNodeTable[THREAD_N*2][TMP_WIDTH_N];
+	enum {
+		TMP = 1,
+		NEXT = 2,
+		PRE = 0
+	};
 
 	ptrNode* getHead() {
+		return head;
+	}
+
+	void addTmpNode(int tid, node* node, int place) {
+		tmpNodeTable[tid][place].store((unsigned int)node);
+	}
+
+	void clearTmpNodes(int tid) {
+		for (int i = 0; i < TMP_WIDTH_N; i++)
+			tmpNodeTable[tid][i].store(0);
+	}
+	//retireNodes
+	void deleteNodes_weak() {
+		if (retireNow.fetch_add(1) != 0)
+			return;
+		ptrNode* ptr = getHead();
+		ptrNode* delPtr = ptr->next;
+		while (true)
+		{
+			bool isUsed = false;
+			for (int i = 0; i < THREAD_N * 2; i++) {
+				for (int j = 0; j < TMP_WIDTH_N; j++) {
+					if (tmpNodeTable[i][j].load() == delPtr->nodePtr) {
+						isUsed = true;
+						goto outside;
+					}
+				}
+			}
+		outside:
+			// it may miss node when insert node between each one, so use atomic check it
+			if (!isUsed) {
+				//ptr->next.store(delPtr->next.load()); <- it is origin version but it will miss node
+				if (ptr->next.compare_exchange_weak(delPtr, delPtr->next.load())) {
+					delete delPtr;
+					k.fetch_add(1);
+				}
+				else
+					continue;
+			}
+			else
+				ptr = ptr->next;
+			delPtr = ptr->next;
+			if (!delPtr)
+				break;
+		}
+		retireNow.store(0);
+	}
+
+	void pushNode(node* n) {
+		ptrNode* newNode = new ptrNode(n);
+		ptrNode* tmp = nullptr;
+		do {
+			tmp = head->next.load();
+			newNode->next.store(tmp);
+			tmp = newNode->next.load();
+		} while (!head->next.compare_exchange_weak(tmp, newNode));
+	}
+
+	retireList() {
+		head = new ptrNode(NULL);
+		tail = new ptrNode(NULL);
+		head->next = tail;
+	}
+	~retireList() {
+		deleteNodes();
+	}
+
+private:
+	void deleteNodes() {
+		ptrNode* delPtr;
+		int total = 0;
+		for (ptrNode* ptr = getHead(); ptr;)
+		{
+			total++;
+			delPtr = ptr;
+			ptr = ptr->next;
+			delete delPtr;
+		}
+		cout << "final node in retireList : " << total << endl;
+	}
+};
+
+class linkList {
+public:
+	atomic <node*> head, tail;
+	retireList retireList;
+	struct pointerPair
+	{
+		node* leftNode;
+		node* rightNode;
+	};
+
+	linkList() {
+		head = new node(0);
+		tail = new node(INSERT_N + 1);
+		head.load()->next.store(tail);
+	}
+
+	node* getHead() {
 		return head.load();
 	}
 
-	void pushNode(node& retireNode) {
-		ptrNode* n = new ptrNode(&retireNode);
-		n->next = head.load();
-		while (!head.compare_exchange_weak(n->next, n));
-		if (head == nullptr || tail == nullptr)
-			tail = head = head.load();
+	pointerPair getLeftNodeAndRightNode(int value) {
+		pointerPair pointerPair;
+		node* left_node_next = nullptr;
+	search_again:
+		do {
+			atomic <node*> tmpNode;
+			tmpNode.store(head.load()); // 當前首節點
+			retireList.addTmpNode(tid(), tmpNode.load(), retireList.TMP);
+			node* tmpNode_next = tmpNode.load()->next; // 用來查看當前節點有沒有被標註
+			retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
+			if (tmpNode.load()->next != (node*)get_unmarked_ref(tmpNode_next))
+				goto search_again;
+			// 查找目標節點, 且將其設為右節點。
+			do {
+				// 當前節點沒被標註, 左節點前進到當前節點。
+				if (!is_marked_ref(tmpNode_next)) {
+					pointerPair.leftNode = tmpNode.load();
+					left_node_next = tmpNode_next;
+				}
+				// 當前節點往下走一個節點。
+				retireList.addTmpNode(tid(), tmpNode, retireList.PRE);
+				tmpNode.store((node*)get_unmarked_ref(tmpNode_next));
+				retireList.addTmpNode(tid(), tmpNode, retireList.TMP);
+				// 走到尾退出, leftNode為最後一個沒被marked的節點。
+				if (tmpNode == tail.load()) break;
+				// 得到新節點的標註
+				tmpNode_next = tmpNode.load()->next;
+				retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
+				// 當節點被標註刪除或是數字還沒到就loop again
+			} while (is_marked_ref(tmpNode_next) || (tmpNode.load()->value < value));
+			// 右節點為第一個數字大於目標且未被標註刪除的節點 , leftNode為最後一個沒被marked的節點。
+			pointerPair.rightNode = tmpNode.load();
+			// 如果左右節點相鄰表示不用繞過, 可以回傳目標節點。
+			if (left_node_next == pointerPair.rightNode)
+				// 回傳前檢查結果是否錯誤 (在查找的過程目標被刪除)
+#pragma warning(disable:6011)
+				if ((pointerPair.rightNode != tail) && is_marked_ref(pointerPair.rightNode->next))
+					goto search_again;
+				else
+					return pointerPair;
+			// 繞過被標註節點
+			if (pointerPair.leftNode->next.compare_exchange_weak(left_node_next, pointerPair.rightNode))
+				if ((pointerPair.rightNode != tail) && is_marked_ref(pointerPair.rightNode->next))
+					goto search_again;
+				else
+					return pointerPair;
+		} while (true);
 	}
 
-	ptrNode* deleteNode(ptrNode* ptr) {
-		ptrNode* front = head.load();
-		if (front == ptr) {
-			head.store(front->next);
-			ptr = ptr->next;
-			delete front;
-			return ptr;
-		}
-		for (ptrNode* innerPtr = front->next; innerPtr; innerPtr = innerPtr->next) {
-			if (innerPtr == ptr) {
-				front->next = innerPtr->next;
-				ptr = ptr->next;
-				delete innerPtr;
-				break;
-			}
-			front = front->next;
-		}
-		return ptr;
+	void insertNode(int value) {
+		node* new_node = new node(value);
+		node* right_node = nullptr;
+		node* left_node = nullptr;
+		do {
+			pointerPair pointerPair = getLeftNodeAndRightNode(value);
+			left_node = pointerPair.leftNode;
+			right_node = pointerPair.rightNode;
+
+			if ((right_node != tail.load()) && (right_node->value == value))
+				break; // 節點已存在
+			new_node->next.store(right_node);
+			if (left_node->next.compare_exchange_weak(right_node, new_node))
+				break; // CAS插入
+		} while (true);
+		retireList.clearTmpNodes(tid());
 	}
 
-	void clearNodes() {
-		ptrNode* delPtr;
-		for (ptrNode* ptr = (ptrNode*)head; ptr;)
+	void deleteNode(int value) {
+		retireList.deleteNodes_weak();
+		node* right_node = nullptr;
+		node* right_node_next = nullptr;
+		node* left_node = nullptr;
+		do {
+			pointerPair pointerPair = getLeftNodeAndRightNode(value);
+			left_node = pointerPair.leftNode;
+			right_node = pointerPair.rightNode;
+
+			if ((right_node == tail) || (right_node->value != value))
+				continue; // do not find target value
+			right_node_next = right_node->next.load();
+			if (!is_marked_ref(right_node_next))
+				if (right_node->next.compare_exchange_weak(right_node_next, (node*)get_marked_ref(right_node_next)))
+					break; // 當右節點的next沒被標記, 就標記右節點的next
+		} while (true);
+		retireList.pushNode(right_node);
+		// 試著使左結點跳過右節點往下走, 失敗就再跑一次搜尋, 其可以跳過被標記節點。
+		if (!left_node->next.compare_exchange_weak(right_node, right_node_next))
+			getLeftNodeAndRightNode(value);
+		deletes.fetch_add(1);
+		retireList.clearTmpNodes(tid());
+		return;
+	}
+
+	~linkList() {
+		node* delPtr;
+		for (node* ptr = this->getHead(); ptr;)
 		{
 			delPtr = ptr;
 			ptr = ptr->next;
@@ -101,176 +295,12 @@ public:
 	}
 };
 
-class threadViewNode {
-public:
-	int tid;
-	int status = 0;
-	threadViewNode* next;
-	atomic_int threadViewNow[3];
-	threadViewNode(int tid) {
-		this->tid = tid;
-		next = nullptr;
-		for (int i = 0; i < 3; i++) {
-			threadViewNow[i].store(-1);
-		}
-	}
-
-	void pushNode(node* nodeT) {
-		if (nodeT == nullptr) return;
-		//cout << "tmp:" << nodeT->value;
-		threadViewNow[status].store(nodeT->value);
-		if (++status > 2)
-			status = 0;
-	}
-
-	void clearNode() {
-		status = 0;
-		for (int i = 0; i < 3; i++) {
-			threadViewNow[i].store(-1);
-		}
-	}
-};
-
-class tmpViewTable {
-public:
-	atomic <threadViewNode*> head, tail;
-	tmpViewTable() {
-		head = nullptr;
-		for (int i = 0; i < THREAD_N; i++) {
-			pushNode(i);
-		}
-	}
-
-	threadViewNode* getHead() {
-		return head.load();
-	}
-
-	void pushNode(int tid) {
-		threadViewNode* n = new threadViewNode(tid);
-		n->next = head.load();
-		while (!head.compare_exchange_weak(n->next, n));
-		if (head == nullptr || tail == nullptr)
-			tail = head = head.load();
-	}
-
-	void addThreadTmpView(int tid, node& node) {
-		for (threadViewNode* ptr = head.load(); ptr; ptr = ptr->next) {
-			if (ptr->tid == tid) {
-				ptr->pushNode(&node);
-				return;
-			}
-		}
-	}
-
-	void releaseNode(int tid) {
-		for (threadViewNode* ptr = head.load(); ptr; ptr = ptr->next) {
-			if (ptr->tid == tid) {
-				ptr->clearNode();
-				return;
-			}
-		}
-	}
-};
-
-class linkList {
-public:
-	atomic <node*> head, tail;
-	retireList retireList;
-	tmpViewTable tmpViewTable;
-	linkList() {
-		head = tail = NULL;
-	}
-
-	node* getHead() {
-		return head.load();
-	}
-
-	void pushNode(int value) {
-		tmpViewTable.addThreadTmpView(tid(), *head.load());
-		node* n = new node(value);
-		n->next = head.load();
-		tmpViewTable.addThreadTmpView(tid(), *head.load());
-		while (!head.compare_exchange_weak(n->next, n));
-		tmpViewTable.releaseNode(tid());
-		if (head == NULL || tail == NULL)
-			tail = head = head.load();
-	}
-
-	void deleteNode(int value) {
-		retireNode();
-		while (true)
-		{
-			for (node* ptr = head.load(); ptr; ptr = ptr->next)
-			{
-				if (ptr == (node*)(0xDDDDDDDD)) break;
-				//if (ptr == nullptr) {
-				//	tmpViewTable.releaseNode(tid());
-				//	return;
-				//}
-				tmpViewTable.addThreadTmpView(tid(), *ptr);
-				if (ptr->value == value) {
-					this->retireList.pushNode(*ptr);
-					tmpViewTable.releaseNode(tid());
-					return;
-				}
-				if (ptr == tail.load()) break;
-			}
-		}
-	}
-
-	void retireNode() {
-		if (retireNow.fetch_add(1) != 0)
-			return;
-		for (ptrNode* ptr = retireList.head; ptr ; ptr = ptr->next) {
-		skip_loop_plus:
-			if (ptr == nullptr) {
-				retireNow.store(0);
-				return;
-			}
-			bool isDelete = true;
-			for (threadViewNode* threadPtr = tmpViewTable.getHead(); threadPtr; threadPtr = threadPtr->next) {
-				for (int i = 0; i < 3; i++) {
-					if (threadPtr->threadViewNow[i] == ptr->nodePtr->value)
-						isDelete = false;
-				}
-			}
-			if (isDelete) {
-				node* front = head.load();
-				if (front == ptr->nodePtr) {
-					//cout << "delete:" << ptr->nodePtr->value << endl;
-					ptr =  retireList.deleteNode(ptr);
-					head.store(front->next);
-					//delete front;
-					front = nullptr;
-					deletes.fetch_add(1);
-					goto skip_loop_plus;
-				}
-				for (node* innerPtr = front->next; innerPtr; innerPtr = innerPtr->next) {
-					if (innerPtr == ptr->nodePtr) {
-						//cout << "delete:" << ptr->nodePtr->value << endl;
-						ptr = retireList.deleteNode(ptr);
-						gMutex.lock();
-						front->next = innerPtr->next;
-						gMutex.unlock();
-						//delete innerPtr;
-						innerPtr = nullptr;
-						deletes.fetch_add(1);
-						goto skip_loop_plus;
-					}
-					front = front->next;
-				}
-			}
-		}
-		retireNow.store(0);
-	}
-};
-
-static atomic <int> insertCount = 0;
-static atomic <int> deleteCount = 0;
+static atomic <int> insertCount = 1;
+static atomic <int> deleteCount = 1;
 
 void insertNode(linkList* linkList) {
 	for (int i = 0; i < ELEMENT_N; i++) {
-		linkList->pushNode(insertCount.fetch_add(1));
+		linkList->insertNode(insertCount.fetch_add(1));
 	}
 }
 
@@ -298,15 +328,17 @@ int main()
 		threads_insert[i].join();
 		threads_delete[i].join();
 	}
-	testlinkList->retireNode();
 
 	int count = 0;
 	cout << "finally" << endl;
 	for (node* ptr = testlinkList->getHead(); ptr; ptr = ptr->next) {
-		cout << ptr->value << endl;
+		//cout << ptr->value << endl;
 		count++;
 	}
-
-	cout << "inserts:" << atomic_load(&inserts) << "  count" << count << endl;
-	cout << "delete: " << atomic_load(&deletes) << endl;
+	testlinkList->retireList.deleteNodes_weak();
+	delete testlinkList;
+	cout << "delete retireList node by __weak count : " << k << endl;
+	cout << "inserts : " << atomic_load(&inserts) << "  after opration count : " << count << endl;
+	cout << "logic delete : " << atomic_load(&deletes) << endl;
+	cout << "phycical delete : " << nodeDeleteCount.load() << endl;
 }

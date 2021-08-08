@@ -54,6 +54,7 @@ public:
 		{
 			delPtr = ptr;
 			ptr = ptr->next;
+			delete delPtr->nodePtr;
 			delete delPtr;
 		}
 		cout << "clean retireList" << endl;
