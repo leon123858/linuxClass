@@ -82,6 +82,7 @@ class retireList
 public:
 	ptrNode* head, * tail;
 	atomic <unsigned int> tmpNodeTable[THREAD_N*2][TMP_WIDTH_N];
+	atomic_bool newTmp = false;
 	enum {
 		TMP = 1,
 		NEXT = 2,
@@ -94,6 +95,7 @@ public:
 
 	void addTmpNode(int tid, node* node, int place) {
 		tmpNodeTable[tid][place].store((unsigned int)node);
+		newTmp.store(true);
 	}
 
 	void clearTmpNodes(int tid) {
@@ -109,6 +111,7 @@ public:
 		while (true)
 		{
 			bool isUsed = false;
+			newTmp.store(false);
 			for (int i = 0; i < THREAD_N * 2; i++) {
 				for (int j = 0; j < TMP_WIDTH_N; j++) {
 					if (tmpNodeTable[i][j].load() == delPtr->nodePtr) {
@@ -121,7 +124,7 @@ public:
 			// it may miss node when insert node between each one, so use atomic check it
 			if (!isUsed) {
 				//ptr->next.store(delPtr->next.load()); <- it is origin version but it will miss node
-				if (ptr->next.compare_exchange_weak(delPtr, delPtr->next.load())) {
+				if (!newTmp && ptr->next.compare_exchange_weak(delPtr, delPtr->next.load())) {
 					delete delPtr;
 					k.fetch_add(1);
 				}
@@ -201,7 +204,7 @@ public:
 			retireList.addTmpNode(tid(), tmpNode.load(), retireList.TMP);
 			node* tmpNode_next = tmpNode.load()->next; // 用來查看當前節點有沒有被標註
 			retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
-			if (tmpNode.load()->next != (node*)get_unmarked_ref(tmpNode_next))
+			if (tmpNode.load()->next !=tmpNode_next)
 				goto search_again;
 			// 查找目標節點, 且將其設為右節點。
 			do {
@@ -210,6 +213,8 @@ public:
 					pointerPair.leftNode = tmpNode.load();
 					left_node_next = tmpNode_next;
 				}
+				if (tmpNode.load()->next != tmpNode_next)
+					goto search_again;
 				// 當前節點往下走一個節點。
 				retireList.addTmpNode(tid(), tmpNode, retireList.PRE);
 				tmpNode.store((node*)get_unmarked_ref(tmpNode_next));
@@ -217,6 +222,8 @@ public:
 				// 走到尾退出, leftNode為最後一個沒被marked的節點。
 				if (tmpNode == tail.load()) break;
 				// 得到新節點的標註
+				if (tmpNode.load() == nullptr)
+					goto search_again;
 				tmpNode_next = tmpNode.load()->next;
 				retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
 				// 當節點被標註刪除或是數字還沒到就loop again
@@ -256,10 +263,10 @@ public:
 				break; // CAS插入
 		} while (true);
 		retireList.clearTmpNodes(tid());
+		retireList.deleteNodes_weak();
 	}
 
 	void deleteNode(int value) {
-		retireList.deleteNodes_weak();
 		node* right_node = nullptr;
 		node* right_node_next = nullptr;
 		node* left_node = nullptr;
