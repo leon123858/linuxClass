@@ -1,7 +1,6 @@
 ﻿#include <iostream>
 #include <atomic>
 #include <thread>
-#include <mutex>
 
 #define TMP_WIDTH_N 3
 #define THREAD_N 100
@@ -105,7 +104,7 @@ public:
 	void deleteNodes_weak(int tid) {
 		ptrNode* ptr = getHead(tid);
 		ptrNode* delPtr = ptr->next;
-
+		cout << "try retire" << endl;
 		while (true)
 		{
 			if (!delPtr)
@@ -187,60 +186,9 @@ public:
 		return head.load();
 	}
 	pointerPair getLeftNodeAndRightNode(int value, node* delNode) {
-		pointerPair pointerPair;
-		node* left_node_next = nullptr;
-	search_again:
-		do {
-			atomic <node*> tmpNode;
-			tmpNode.store(head.load()); // 當前首節點
-			retireList.addTmpNode(tid(), tmpNode.load(), retireList.TMP);
-			node* tmpNode_next = tmpNode.load()->next; // 用來查看當前節點有沒有被標註
-			retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
-			if (tmpNode.load()->next !=tmpNode_next)
-				goto search_again;
-			// 查找目標節點, 且將其設為右節點。
-			do {
-				// 當前節點沒被標註, 左節點前進到當前節點。
-				if (!is_marked_ref(tmpNode_next)) {
-					pointerPair.leftNode = tmpNode.load();
-					left_node_next = tmpNode_next;
-				}
-				if (tmpNode.load()->next != tmpNode_next)
-					goto search_again;
-				// 當前節點往下走一個節點。
-				retireList.addTmpNode(tid(), tmpNode, retireList.PRE);
-				tmpNode.store((node*)get_unmarked_ref(tmpNode_next));
-				retireList.addTmpNode(tid(), tmpNode, retireList.TMP);
-				// 走到尾退出, leftNode為最後一個沒被marked的節點。
-				if (tmpNode == tail.load()) break;
-				// 得到新節點的標註
-				if (tmpNode.load() == nullptr)
-					goto search_again;
-				tmpNode_next = tmpNode.load()->next;
-				retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
-				// 當節點被標註刪除或是數字還沒到就loop again
-			} while (is_marked_ref(tmpNode_next) || (tmpNode.load()->value < value));
-			// 右節點為第一個數字大於目標且未被標註刪除的節點 , leftNode為最後一個沒被marked的節點。
-			pointerPair.rightNode = tmpNode.load();
-			// 如果左右節點相鄰表示不用繞過, 可以回傳目標節點。
-			if (left_node_next == pointerPair.rightNode)
-				// 回傳前檢查結果是否錯誤 (在查找的過程目標被刪除)
-#pragma warning(disable:6011)
-				if ((pointerPair.rightNode != tail) && is_marked_ref(pointerPair.rightNode->next))
-					goto search_again;
-				else {
-					retireList.pushNode(delNode,tid());
-					return pointerPair;
-				}
-			// 繞過被標註節點
-			if (pointerPair.leftNode->next.compare_exchange_weak(left_node_next, pointerPair.rightNode))
-				if ((pointerPair.rightNode != tail) && is_marked_ref(pointerPair.rightNode->next))
-					goto search_again;
-				else {
-					retireList.pushNode(delNode,tid());
-					return pointerPair;
-				}
-		} while (true);
+		pointerPair pP = getLeftNodeAndRightNode(value);
+		retireList.pushNode(delNode, tid());
+		return pP;
 	}
 
 	pointerPair getLeftNodeAndRightNode(int value) {
@@ -324,7 +272,7 @@ public:
 			right_node = pointerPair.rightNode;
 
 			if ((right_node == tail) || (right_node->value != value))
-				return; // do not find target value
+				continue; // do not find target value
 			right_node_next = right_node->next.load();
 			if (!is_marked_ref(right_node_next))
 				if (right_node->next.compare_exchange_weak(right_node_next, (node*)get_marked_ref(right_node_next)))
