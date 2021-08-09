@@ -1,6 +1,8 @@
 ﻿#include <iostream>
 #include <atomic>
 #include <thread>
+#include <mutex>
+
 #define TMP_WIDTH_N 3
 #define THREAD_N 100
 #define ELEMENT_N 100
@@ -14,8 +16,6 @@ static atomic_int nodeDeleteCount = 0;
 
 static thread_local int tid_v = TID_UNKNOWN;
 static atomic_int_fast32_t tid_v_base = ATOMIC_VAR_INIT(0);
-
-static atomic_int_fast32_t retireNow = 0;
 
 static atomic_int k = 0;
 
@@ -80,7 +80,7 @@ public:
 class retireList
 {
 public:
-	ptrNode* head, * tail;
+	ptrNode* head[THREAD_N * 2];
 	atomic <unsigned int> tmpNodeTable[THREAD_N*2][TMP_WIDTH_N];
 	atomic_bool newTmp = false;
 	enum {
@@ -89,13 +89,12 @@ public:
 		PRE = 0
 	};
 
-	ptrNode* getHead() {
-		return head;
+	ptrNode* getHead(int tid) {
+		return head[tid];
 	}
 
 	void addTmpNode(int tid, node* node, int place) {
 		tmpNodeTable[tid][place].store((unsigned int)node);
-		newTmp.store(true);
 	}
 
 	void clearTmpNodes(int tid) {
@@ -103,28 +102,26 @@ public:
 			tmpNodeTable[tid][i].store(0);
 	}
 	//retireNodes
-	void deleteNodes_weak() {
-		if (retireNow.fetch_add(1) != 0)
-			return;
-		ptrNode* ptr = getHead();
+	void deleteNodes_weak(int tid) {
+		ptrNode* ptr = getHead(tid);
 		ptrNode* delPtr = ptr->next;
+
 		while (true)
 		{
-			bool isUsed = false;
-			newTmp.store(false);
+			if (!delPtr)
+				break;
+			bool canDelete = true;
 			for (int i = 0; i < THREAD_N * 2; i++) {
 				for (int j = 0; j < TMP_WIDTH_N; j++) {
 					if (tmpNodeTable[i][j].load() == delPtr->nodePtr) {
-						isUsed = true;
+						canDelete = false;
 						goto outside;
 					}
 				}
 			}
 		outside:
-			// it may miss node when insert node between each one, so use atomic check it
-			if (!isUsed) {
-				//ptr->next.store(delPtr->next.load()); <- it is origin version but it will miss node
-				if (!newTmp && ptr->next.compare_exchange_weak(delPtr, delPtr->next.load())) {
+			if (canDelete) {
+				if (ptr->next.compare_exchange_weak(delPtr, delPtr->next.load())) {
 					delete delPtr;
 					k.fetch_add(1);
 				}
@@ -134,26 +131,19 @@ public:
 			else
 				ptr = ptr->next;
 			delPtr = ptr->next;
-			if (!delPtr)
-				break;
 		}
-		retireNow.store(0);
 	}
 
-	void pushNode(node* n) {
+	void pushNode(node* n,int tid) {
 		ptrNode* newNode = new ptrNode(n);
-		ptrNode* tmp = nullptr;
-		do {
-			tmp = head->next.load();
-			newNode->next.store(tmp);
-			tmp = newNode->next.load();
-		} while (!head->next.compare_exchange_weak(tmp, newNode));
+		newNode->next.store(head[tid]->next.load());
+		head[tid]->next.store(newNode);
+		deleteNodes_weak(tid);
 	}
 
 	retireList() {
-		head = new ptrNode(NULL);
-		tail = new ptrNode(NULL);
-		head->next = tail;
+		for(int tid=0;tid <THREAD_N*2;tid++)
+			head[tid] = new ptrNode(NULL);
 	}
 	~retireList() {
 		deleteNodes();
@@ -163,12 +153,15 @@ private:
 	void deleteNodes() {
 		ptrNode* delPtr;
 		int total = 0;
-		for (ptrNode* ptr = getHead(); ptr;)
-		{
-			total++;
-			delPtr = ptr;
-			ptr = ptr->next;
-			delete delPtr;
+		for (int tid = 0; tid < THREAD_N*2; tid++) {
+			for (ptrNode* ptr = getHead(tid); ptr;)
+			{
+				if(ptr->nodePtr != NULL)
+					total++;
+				delPtr = ptr;
+				ptr = ptr->next;
+				delete delPtr;
+			}
 		}
 		cout << "final node in retireList : " << total << endl;
 	}
@@ -192,6 +185,62 @@ public:
 
 	node* getHead() {
 		return head.load();
+	}
+	pointerPair getLeftNodeAndRightNode(int value, node* delNode) {
+		pointerPair pointerPair;
+		node* left_node_next = nullptr;
+	search_again:
+		do {
+			atomic <node*> tmpNode;
+			tmpNode.store(head.load()); // 當前首節點
+			retireList.addTmpNode(tid(), tmpNode.load(), retireList.TMP);
+			node* tmpNode_next = tmpNode.load()->next; // 用來查看當前節點有沒有被標註
+			retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
+			if (tmpNode.load()->next !=tmpNode_next)
+				goto search_again;
+			// 查找目標節點, 且將其設為右節點。
+			do {
+				// 當前節點沒被標註, 左節點前進到當前節點。
+				if (!is_marked_ref(tmpNode_next)) {
+					pointerPair.leftNode = tmpNode.load();
+					left_node_next = tmpNode_next;
+				}
+				if (tmpNode.load()->next != tmpNode_next)
+					goto search_again;
+				// 當前節點往下走一個節點。
+				retireList.addTmpNode(tid(), tmpNode, retireList.PRE);
+				tmpNode.store((node*)get_unmarked_ref(tmpNode_next));
+				retireList.addTmpNode(tid(), tmpNode, retireList.TMP);
+				// 走到尾退出, leftNode為最後一個沒被marked的節點。
+				if (tmpNode == tail.load()) break;
+				// 得到新節點的標註
+				if (tmpNode.load() == nullptr)
+					goto search_again;
+				tmpNode_next = tmpNode.load()->next;
+				retireList.addTmpNode(tid(), (node*)get_unmarked_ref(tmpNode_next), retireList.NEXT);
+				// 當節點被標註刪除或是數字還沒到就loop again
+			} while (is_marked_ref(tmpNode_next) || (tmpNode.load()->value < value));
+			// 右節點為第一個數字大於目標且未被標註刪除的節點 , leftNode為最後一個沒被marked的節點。
+			pointerPair.rightNode = tmpNode.load();
+			// 如果左右節點相鄰表示不用繞過, 可以回傳目標節點。
+			if (left_node_next == pointerPair.rightNode)
+				// 回傳前檢查結果是否錯誤 (在查找的過程目標被刪除)
+#pragma warning(disable:6011)
+				if ((pointerPair.rightNode != tail) && is_marked_ref(pointerPair.rightNode->next))
+					goto search_again;
+				else {
+					retireList.pushNode(delNode,tid());
+					return pointerPair;
+				}
+			// 繞過被標註節點
+			if (pointerPair.leftNode->next.compare_exchange_weak(left_node_next, pointerPair.rightNode))
+				if ((pointerPair.rightNode != tail) && is_marked_ref(pointerPair.rightNode->next))
+					goto search_again;
+				else {
+					retireList.pushNode(delNode,tid());
+					return pointerPair;
+				}
+		} while (true);
 	}
 
 	pointerPair getLeftNodeAndRightNode(int value) {
@@ -263,7 +312,6 @@ public:
 				break; // CAS插入
 		} while (true);
 		retireList.clearTmpNodes(tid());
-		retireList.deleteNodes_weak();
 	}
 
 	void deleteNode(int value) {
@@ -276,16 +324,18 @@ public:
 			right_node = pointerPair.rightNode;
 
 			if ((right_node == tail) || (right_node->value != value))
-				continue; // do not find target value
+				return; // do not find target value
 			right_node_next = right_node->next.load();
 			if (!is_marked_ref(right_node_next))
 				if (right_node->next.compare_exchange_weak(right_node_next, (node*)get_marked_ref(right_node_next)))
 					break; // 當右節點的next沒被標記, 就標記右節點的next
 		} while (true);
-		retireList.pushNode(right_node);
+		node* tmp = right_node;
 		// 試著使左結點跳過右節點往下走, 失敗就再跑一次搜尋, 其可以跳過被標記節點。
 		if (!left_node->next.compare_exchange_weak(right_node, right_node_next))
-			getLeftNodeAndRightNode(value);
+			getLeftNodeAndRightNode(value,tmp);
+		else
+			retireList.pushNode(tmp, tid());
 		deletes.fetch_add(1);
 		retireList.clearTmpNodes(tid());
 		return;
@@ -342,7 +392,6 @@ int main()
 		//cout << ptr->value << endl;
 		count++;
 	}
-	testlinkList->retireList.deleteNodes_weak();
 	delete testlinkList;
 	cout << "delete retireList node by __weak count : " << k << endl;
 	cout << "inserts : " << atomic_load(&inserts) << "  after opration count : " << count << endl;
