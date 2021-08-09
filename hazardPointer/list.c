@@ -17,7 +17,7 @@
 #define HP_MAX_THREADS 128
 #define HP_MAX_HPS 5 /* This is named 'K' in the HP paper */
 #define CLPAD (128 / sizeof(uintptr_t))
-#define HP_THRESHOLD_R 0 /* This is named 'R' in the HP paper */
+#define HP_THRESHOLD_R HP_MAX_THREADS*3 /* This is named 'R' in the HP paper */
 
 /* Maximum number of retired objects per thread */
 #define HP_MAX_RETIRED (HP_MAX_THREADS * HP_MAX_HPS)
@@ -121,6 +121,10 @@ uintptr_t list_hp_protect_release(list_hp_t *hp, int ihp, uintptr_t ptr)
     return ptr;
 }
 
+int cmpfunc (const void * a, const void * b) {
+   return ( *(int*)a - *(int*)b );
+}
+
 /* Retire an object that is no longer in use by any thread, calling
  * the delete function that was specified in list_hp_new().
  *
@@ -134,20 +138,18 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
 
     if (rl->size < HP_THRESHOLD_R)
         return;
-
+    unsigned int array[HP_MAX_THREADS*3];
+    int len = 0;
+    for (int itid = 0; itid < HP_MAX_THREADS; itid++) {
+        for (int ihp = hp->max_hps - 1; ihp >= 0; ihp--) {
+            array[len++] = atomic_load(&hp->hp[itid][ihp]);
+        }
+    }
+    qsort(array, len, sizeof(unsigned int), cmpfunc);
     for (size_t iret = 0; iret < rl->size; iret++) {
         uintptr_t obj = rl->list[iret];
-        bool can_delete = true;
-        for (int itid = 0; itid < HP_MAX_THREADS && can_delete; itid++) {
-            for (int ihp = hp->max_hps - 1; ihp >= 0; ihp--) {
-                if (atomic_load(&hp->hp[itid][ihp]) == obj) {
-                    can_delete = false;
-                    break;
-                }
-            }
-        }
-
-        if (can_delete) {
+        if(bsearch(&obj,array,len,sizeof(unsigned int),cmpfunc))
+        {
             size_t bytes = (rl->size - iret) * sizeof(rl->list[0]);
             memmove(&rl->list[iret], &rl->list[iret + 1], bytes);
             rl->size--;
