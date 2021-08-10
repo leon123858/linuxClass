@@ -187,6 +187,7 @@ public:
 	}
 	pointerPair getLeftNodeAndRightNode(int value, node* delNode) {
 		pointerPair pP = getLeftNodeAndRightNode(value);
+		retireList.addTmpNode(tid(), delNode, retireList.NEXT);
 		retireList.pushNode(delNode, tid());
 		return pP;
 	}
