@@ -1,25 +1,27 @@
 ﻿#include <winsock2.h>
 #include <ws2tcpip.h>
+#include <direct.h>
+#include <Windows.h>
 #include <iostream>
 #include <string>
+#include <vector>
+#include <thread>
 
 #define forever while(true)
-#define DEFAULT_ERROR_404 "404 Not Found"
+#define DEFAULT_ERROR_404 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
 #define DEFAULT_PORT 1337
 #define REQUEST_BUFFER_SIZE 1024
 #define FAIL_CODE -1
+#define BUFFER_N 1024
 
 using namespace std;
-
-class response {
-
-};
 
 class request {
 public:
 	enum {
-		GET=0,
-		POST=1
+		GET = 0,
+		POST = 1,
+		UNKNOW = -1
 	};
 	int messageLength;
 	int requestType;
@@ -28,64 +30,169 @@ public:
 	string filePath;
 	string body;
 	request(sockaddr_in& setting, SOCKET& messageSocket) {
-		inet_ntop(AF_INET, &setting.sin_addr, clientIP, sizeof(clientIP));
-		clientPort = htons(setting.sin_port);
+		setIpandPort(setting);
 		char buffer[REQUEST_BUFFER_SIZE];
 		messageLength = recv(messageSocket, buffer, sizeof(buffer), 0);
-		string requestStr = buffer;
-		// todo : get requestType, filePath , body from requestStr
-	}
-	~request() {
-
+		if (messageLength == 0) return;
+		destructStr(buffer);
 	}
 private:
+	void setIpandPort(sockaddr_in& setting) {
+		inet_ntop(AF_INET, &setting.sin_addr, clientIP, sizeof(clientIP));
+		clientPort = htons(setting.sin_port);
+	}
+	void destructStr(char* buffer) {
+		string requestStr = buffer;
+		int index = 0;
+		index = setRequestType(requestStr, index);
+		index = setFilePath(requestStr, index);
+		index = setBody(requestStr, index);
+	}
+	int setRequestType(string& str, int start) {
+		int firstSpaceIndex = str.find(" ", start);
+		if (firstSpaceIndex == -1)
+			throw;
+		string type = str.substr(0, firstSpaceIndex);
+		if (type == "GET")
+			requestType = GET;
+		else if (type == "POST")
+			requestType = POST;
+		else
+			requestType = UNKNOW;
+		return firstSpaceIndex;
+	}
+	int setFilePath(string& str, int start) {
+		int nextSpaceIndex = str.find(" ", start + 1);
+		filePath = str.substr(start + 1, nextSpaceIndex - start - 1);
+		return nextSpaceIndex;
+	}
+	int setBody(string& str, int start) {
+		//skip
+		return 1;
+	}
+};
 
+class response {
+public:
+	vector<string> GetRouters;
+	vector<string> PostRouters;
+	response() {
+		// add routers
+		GetRouters.push_back("/getFile/");
+	}
+	int runGetRoute(SOCKET& socket, string route) {
+		for (auto i : GetRouters) {
+			if (0 == route.find(i)) {
+				matchStr = i;
+				goto routers;
+			}
+		}
+		return notFound(socket);
+	routers:
+		if (matchStr == "/getFile/")
+			return getFile(socket, route);
+		else
+			return notFound(socket);
+	}
+private:
+	string matchStr;
+	int getFile(SOCKET& socket, string& route) {
+		string header = "HTTP/1.1 200 OK\r\nContent-Type: " + getContentType(route) + "; charset=UTF-8\r\n\r\n";
+		string path = route.substr(matchStr.length(), route.length());
+		string curFilePath = getCurFilePath();
+		string goalFilePth = curFilePath + path;
+		const char* headerChr = header.c_str();
+		char buffer[1024] = { 0 };
+		FILE* file;
+		int readLength;
+		int sendResult;
+		errno_t err = fopen_s(&file, path.c_str(), "rb");
+		if (err != 0) return notFound(socket);
+		sendResult = send(socket, headerChr, strlen(headerChr), 0);
+		if (sendResult == SOCKET_ERROR) {
+			printf("Error sending header, reconnecting...\n");
+			closesocket(socket);
+			return -1;
+		}
+		while ((readLength = fread(buffer, 1, 1024, file)) > 0) {
+			sendResult = send(socket, buffer, readLength, 0);
+			if (sendResult == SOCKET_ERROR) {
+				printf("Error sending body, reconnecting...\n");
+				closesocket(socket);
+				return -1;
+			}
+			else if(readLength <= 0)
+			{
+				printf("Read File Error, End The Program\n");
+				closesocket(socket);
+				return readLength;
+			}
+		}
+		fclose(file);
+		closesocket(socket);
+		return 1;
+	}
+	int notFound(SOCKET& socket) {
+		send(socket, DEFAULT_ERROR_404, strlen(DEFAULT_ERROR_404), 0);
+		closesocket(socket);
+		return 1;
+	}
+	string getCurFilePath() {
+		char filename[1024] = { 0 };
+#pragma warning(disable: 6031)
+		_getcwd(filename, 1024);
+		if (filename[strlen(filename)] != '\\')
+			strcat_s(filename, "\\");
+		return filename;
+	}
+	string getContentType(string route)
+	{
+		int index = route.find_last_of('.');
+		if (index == -1)
+			return "*/*";
+		string extension = route.substr(index);
+		if (extension == ".html")
+			return "text/html";
+		else if (extension == ".ico")
+			return "image/webp";
+		else if (extension == ".css")
+			return "text/css";
+		else if (extension == ".jpg")
+			return "image/jpeg";
+		else if (extension == ".js")
+			return "text/javascript";
+		return "*/*";
+	}
 };
 
 class httpServer {
 public:
+	response response;
 	struct sockaddr_in localSocketSetting, clientSocketSetting;
 	SOCKET listenSocket, messageSocket;
 	WSADATA windowsSocketData;
 	void start() {
 		thread_local int count = 0;
-	listen_goto:
+	rebuild:
 		if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR)
-			errorHandle("listen()");
-
-		printf("Waiting for connection...\n");
-
+			errorHandle("listen");
+		printf("Start.......\n");
 		forever
 		{
 			int clientSocketSettingLength;
 			clientSocketSettingLength = sizeof(clientSocketSetting);
 			messageSocket = accept(listenSocket, (struct sockaddr*)&clientSocketSetting, &clientSocketSettingLength);
-
 			if (messageSocket == INVALID_SOCKET || messageSocket == FAIL_CODE)
-				errorHandle("accept()");
-			/*char clientIP[16];
-			inet_ntop(AF_INET, &clientSocketSetting.sin_addr, clientIP, sizeof(clientIP));
-			printf("\n\n#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$#$ %d\n\n", ++count);
-			printf("Connected to %s:%d\n", clientIP, htons(clientSocketSetting.sin_port));*/
-
-			/*int messageLength;
-			char buffer[REQUEST_BUFFER_SIZE];
-			string requestStr;
-			messageLength = recv(messageSocket, buffer, sizeof(buffer), 0);
-			requestStr = buffer;
-			cout << "Client requested : " << endl << requestStr << endl << "end Buffer" << endl;*/
-
-			if (messageLength == 0)
+				errorHandle("accept");
+			request req = request(clientSocketSetting, messageSocket);
+			cout << endl << ++count << " : " << req.filePath;
+			if (req.messageLength == 0)
 				continue;
-
-			int sent = sendResponse(messageSocket);
-
-			closesocket(messageSocket);
-
-			if (sent == 0)
+			int sentResult = responseClient(req);
+			if (sentResult == 0)
 				break;
-			else if (sent == -1)
-				goto listen_goto;
+			else if (sentResult == -1)
+				goto rebuild;
 		}
 	}
 #pragma warning(disable: 26495)
@@ -109,53 +216,29 @@ public:
 	~httpServer() {
 		WSACleanup();
 	}
-
 private:
-	int sendResponse(SOCKET socket) {
-		if (0) {
-			send(socket, DEFAULT_ERROR_404, strlen(DEFAULT_ERROR_404), 0);
-			return 1;
-		}
-
-		/*FILE* f = fopen(response->filepath, "rb");
-		char buf[1024] = { 0 };
-		int msg_len;
-
-		if (!f) {
-			send(socket, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n", 57, 0);
-			return 1;
-		}*/
-		string header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n";
-		const char* chr = header.c_str();
-		send(socket, chr, strlen(chr), 0);
-
-		int result = 19;
-		send(socket, "data data data test", result, 0);
-		cout << "reponse end" << endl;
-		return 1;
-	}
 	void errorHandle(string str) {
 		cout << "error : " << str << endl;
 		exit(FAIL_CODE);
 	}
+	int responseClient(request req) {
+		if (req.requestType == req.GET)
+			return response.runGetRoute(messageSocket, req.filePath);
+		else
+			return response.runGetRoute(messageSocket, "/404");
+	}
 };
 
-
-
-
-//struct sockaddr_in {
-//    short int sin_family; /* 通信类型 */
-//    unsigned short int sin_port; /* 端口 */
-//    struct in_addr sin_addr; /* internet 地址 */
-//    unsigned char sin_zeros[8]; /* 与sockaddr结构的长度相同 */
-//}：
-//
-//struct in_addr {
-//    unsigned long s_addr;
-//}
+void runServer() {
+	httpServer server;
+	server.start();
+}
 
 int main(int argc, char** argv)
 {
-	httpServer server;
-	server.start();
+	thread threadPool[1];
+	for (auto& i : threadPool)
+		i = thread(runServer);
+	for (auto& i : threadPool)
+		i.join();
 }
