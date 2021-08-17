@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <time.h>   
 
 #define forever while(true)
 #define DEFAULT_ERROR_404 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
@@ -13,6 +14,7 @@
 #define REQUEST_BUFFER_SIZE 1024
 #define FAIL_CODE -1
 #define BUFFER_N 1024
+#define THREADPOOL_SIZE 10
 
 using namespace std;
 
@@ -31,6 +33,13 @@ public:
 	string body;
 	request(sockaddr_in& setting, SOCKET& messageSocket) {
 		setIpandPort(setting);
+		char buffer[REQUEST_BUFFER_SIZE];
+		messageLength = recv(messageSocket, buffer, sizeof(buffer), 0);
+		if (messageLength == 0) return;
+		destructStr(buffer);
+	}
+#pragma warning(disable: 26495)
+	request(SOCKET& messageSocket) {
 		char buffer[REQUEST_BUFFER_SIZE];
 		messageLength = recv(messageSocket, buffer, sizeof(buffer), 0);
 		if (messageLength == 0) return;
@@ -121,7 +130,7 @@ private:
 				closesocket(socket);
 				return -1;
 			}
-			else if(readLength <= 0)
+			else if (readLength <= 0)
 			{
 				printf("Read File Error, End The Program\n");
 				closesocket(socket);
@@ -167,51 +176,67 @@ private:
 
 class httpServer {
 public:
-	response response;
-	struct sockaddr_in localSocketSetting, clientSocketSetting;
-	SOCKET listenSocket, messageSocket;
+	struct sockaddr_in localSocketSetting;
+	SOCKET listenSocket;
 	WSADATA windowsSocketData;
-	void start() {
-		thread_local int count = 0;
+	vector<thread> threadPool;
+	vector<vector<SOCKET>> tasksList;
+	void start(int poolNumber) {
+		printf("Start.......\n");
 	rebuild:
 		if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR)
 			errorHandle("listen");
-		printf("Start.......\n");
 		forever
 		{
-			int clientSocketSettingLength;
-			clientSocketSettingLength = sizeof(clientSocketSetting);
-			messageSocket = accept(listenSocket, (struct sockaddr*)&clientSocketSetting, &clientSocketSettingLength);
+			SOCKET messageSocket = getSocket(poolNumber);
 			if (messageSocket == INVALID_SOCKET || messageSocket == FAIL_CODE)
-				errorHandle("accept");
-			request req = request(clientSocketSetting, messageSocket);
-			cout << endl << ++count << " : " << req.filePath;
+				goto rebuild;
+			request req = request(messageSocket);
+			cout << endl << "thread " << poolNumber << " : " << req.filePath;
 			if (req.messageLength == 0)
 				continue;
-			int sentResult = responseClient(req);
+			int sentResult = responseClient(req, messageSocket);
 			if (sentResult == 0)
 				break;
-			else if (sentResult == -1)
+			else if (sentResult == FAIL_CODE)
 				goto rebuild;
 		}
 	}
+	void accepter() {
+		forever{
+			struct sockaddr_in clientSocketSetting;
+			int clientSocketSettingLength;
+			clientSocketSettingLength = sizeof(clientSocketSetting);
+			SOCKET socket = accept(listenSocket, (struct sockaddr*)&clientSocketSetting, &clientSocketSettingLength);
+			int poolNumber = rand() % THREADPOOL_SIZE;
+			tasksList[poolNumber].push_back(socket);
+		}
+	}
+	void go() {
+		thread worker = thread(&httpServer::accepter, this);
+		for (int i = 0; i < THREADPOOL_SIZE; i++)
+			threadPool.push_back(thread(&httpServer::start, this, i));
+		for (auto& i : threadPool)
+			i.join();
+		worker.join();
+	}
 #pragma warning(disable: 26495)
 	httpServer() {
+		for (int i = 0; i < THREADPOOL_SIZE; i++) {
+			vector<SOCKET> tasks;
+			tasksList.push_back(tasks);
+		}
 		if (WSAStartup(MAKEWORD(2, 2), &windowsSocketData) == SOCKET_ERROR)
-			errorHandle("WSAStartup()");
-
+			errorHandle("WSAStartup");
 		// Fill in the address structure
 		localSocketSetting.sin_family = AF_INET;
 		localSocketSetting.sin_addr.s_addr = INADDR_ANY;
 		localSocketSetting.sin_port = htons(DEFAULT_PORT);
-
 		listenSocket = socket(AF_INET, SOCK_STREAM, 0);
-
 		if (listenSocket == INVALID_SOCKET)
-			errorHandle("socket()");
-
+			errorHandle("socket");
 		if (bind(listenSocket, (struct sockaddr*)&localSocketSetting, sizeof(localSocketSetting)) == SOCKET_ERROR)
-			errorHandle("bind()");
+			errorHandle("bind");
 	}
 	~httpServer() {
 		WSACleanup();
@@ -221,24 +246,27 @@ private:
 		cout << "error : " << str << endl;
 		exit(FAIL_CODE);
 	}
-	int responseClient(request req) {
+	int responseClient(request req, SOCKET& messageSocket) {
+		response response;
 		if (req.requestType == req.GET)
 			return response.runGetRoute(messageSocket, req.filePath);
 		else
 			return response.runGetRoute(messageSocket, "/404");
 	}
+	SOCKET getSocket(int poolNumber) {
+		forever{
+			if (tasksList[poolNumber].size() == 0)
+				continue;
+			SOCKET node = tasksList[poolNumber].back();
+			tasksList[poolNumber].pop_back();
+			return node;
+		}
+	}
 };
-
-void runServer() {
-	httpServer server;
-	server.start();
-}
 
 int main(int argc, char** argv)
 {
-	thread threadPool[1];
-	for (auto& i : threadPool)
-		i = thread(runServer);
-	for (auto& i : threadPool)
-		i.join();
+	srand(time(NULL));
+	httpServer server;
+	server.go();
 }
